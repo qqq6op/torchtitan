@@ -11,6 +11,7 @@ schedule actions onto bound stage graph executors.
 """
 
 import logging
+from enum import Enum
 from typing import Any, cast
 
 import torch
@@ -33,7 +34,9 @@ from torch.distributed.pipelining.stage import _normalize_model_output_as_tuple
 from torchtitan.experiments.graph_trainer.common_utils import accumulate_param_grads_
 from torchtitan.experiments.graph_trainer.graph_pp.stage import (
     GraphPipelineStage,
+    GraphPPJointStageGraphs,
     GraphPPOverlapGraphs,
+    GraphPPRuntimeGraphs,
     GraphPPStageGraphs,
     GraphPPStageGraphsProvider,
 )
@@ -47,9 +50,18 @@ logger = logging.getLogger(__name__)
 
 
 __all__ = [
+    "FULL_FORWARD_BACKWARD",
     "GraphPipelineRuntime",
     "register_graph_pp_schedule",
 ]
+
+
+class _GraphComputationType(Enum):
+    # Conventional joint graph with forward, loss, backward, and collectives inside.
+    FULL_FORWARD_BACKWARD = "FULL_FORWARD_BACKWARD"
+
+
+FULL_FORWARD_BACKWARD = _GraphComputationType.FULL_FORWARD_BACKWARD
 
 
 def _scale_grad_values_(grads: list[Any], grad_scale_factor: int) -> None:
@@ -336,7 +348,6 @@ class GraphPipelineRuntime:
             that attaches bound stage graphs before the first runtime action.
             If omitted, every local stage must already have ``stage.graphs``
             populated.
-
     Raises:
         TypeError: If any local schedule stage is not a ``GraphPipelineStage``.
     """
@@ -360,6 +371,12 @@ class GraphPipelineRuntime:
                     "GraphPipelineRuntime requires GraphPipelineStage instances, got "
                     f"{type(stage).__name__}"
                 )
+        assert schedule._stages
+
+    @property
+    def num_microbatches(self) -> int:
+        """Return the number of microbatches owned by this runtime schedule."""
+        return self.schedule._n_microbatches
 
     def ensure_ready(self, ctx: _PipelineContext) -> None:
         """Ensure local stage graphs and runtime state are ready for execution.
@@ -389,7 +406,9 @@ class GraphPipelineRuntime:
                     "GraphPP stage graphs must be built before runtime "
                     f"execution. Missing graphs for stage {graph_stage.stage_index}."
                 )
-            self.stage_graphs[graph_stage.stage_index] = graph_stage.graphs
+            self.stage_graphs[graph_stage.stage_index] = cast(
+                GraphPPStageGraphs, graph_stage.graphs
+            )
             self._populate_stage_states(graph_stage)
         self._graph_pp_ready = True
 
@@ -435,6 +454,55 @@ class GraphPipelineRuntime:
             stage.state.sharded_param_grads
         )
         accumulate_param_grads_(stage.state.trainable_params, param_grads)
+
+    def _accumulate_stage_backward_grads(
+        self,
+        stage: GraphPipelineStage,
+        graphs: GraphPPRuntimeGraphs,
+        grads: list[Any],
+    ) -> None:
+        if graphs.requires_grad_reduction:
+            _accumulate_stage_unsharded_grads(stage, grads)
+            return
+
+        grad_scale_factor = (
+            self.schedule._n_microbatches if self.schedule.scale_grads else 1
+        )
+        _scale_grad_values_(grads, grad_scale_factor)
+        param_grads = graphs.param_grads_for_accumulation(grads)
+        accumulate_param_grads_(
+            stage.state.trainable_params,
+            param_grads,
+            clone_grads_to_initialize_param_grad=True,
+        )
+
+    def _handle_full_forward_backward(
+        self, action: _Action, ctx: _PipelineContext
+    ) -> None:
+        self.ensure_ready(ctx)
+        _, stage = _stage_map_and_stage_from_action(self.schedule, action)
+        mb_index = action.microbatch_index
+        if mb_index is None:
+            raise ValueError(
+                "GraphPP FULL_FORWARD_BACKWARD action must have microbatch "
+                f"index: {action}"
+            )
+        args, kwargs, target = _prepare_fwd_user_args(stage, mb_index, ctx)
+        graphs = cast(GraphPPJointStageGraphs, self.stage_graphs[stage.stage_index])
+        if not stage.has_backward:
+            raise NotImplementedError(
+                "GraphPP FULL_FORWARD_BACKWARD does not support forward-only execution"
+            )
+        loss, param_grads = graphs.forward_backward(
+            args,
+            kwargs,
+            target,
+            self.loss_kwargs,
+        )
+        self.schedule.backward_counter[stage.stage_index] += 1
+        self._accumulate_stage_backward_grads(stage, graphs, param_grads)
+        stage.output_chunks.append(loss)
+        self.schedule._internal_losses.append(loss)
 
     def _handle_forward(self, action: _Action, ctx: _PipelineContext) -> None:
         self.ensure_ready(ctx)
@@ -488,7 +556,7 @@ class GraphPipelineRuntime:
             output_grads_from_next,
             runtime_validate=stage._runtime_validate,
         )
-        _accumulate_stage_unsharded_grads(stage, param_grads)
+        self._accumulate_stage_backward_grads(stage, graphs, param_grads)
         _post_backward_common(
             stage,
             mb_index,
@@ -561,7 +629,7 @@ class GraphPipelineRuntime:
             stage.saved_values_for_backward_weight_cache.pop(mb_index)
         )
         param_grads = graphs.backward_weight(saved_values_for_backward_weight)
-        _accumulate_stage_unsharded_grads(stage, param_grads)
+        self._accumulate_stage_backward_grads(stage, graphs, param_grads)
 
     def _handle_unshard(self, action: _Action, ctx: _PipelineContext) -> None:
         self.ensure_ready(ctx)
@@ -578,11 +646,9 @@ class GraphPipelineRuntime:
         self.ensure_ready(ctx)
         _, stage = _stage_map_and_stage_from_action(self.schedule, action)
         graphs = self.stage_graphs[stage.stage_index]
-        stage.state.sharded_param_grads = graphs.reduce_grads(
-            stage.state.unsharded_param_grads,
-            runtime_validate=stage._runtime_validate,
-        )
-        _scale_graph_pp_sharded_grads(stage, self.schedule)
+        if not graphs.requires_grad_reduction:
+            return
+        self._ensure_reduced_grads(stage)
 
     def _handle_overlap_fw_bw(self, action: _Action, ctx: _PipelineContext) -> None:
         fw_action, bw_action = overlap_fw_bw_sub_actions(action)
@@ -605,6 +671,7 @@ class GraphPipelineRuntime:
 
         args, kwargs, target = _prepare_fwd_user_args(fw_stage, fw_mb_index, ctx)
         fw_graphs = self.stage_graphs[fw_stage.stage_index]
+        bw_graphs = self.stage_graphs[bw_stage.stage_index]
         _ensure_unsharded_param_values(fw_stage, fw_graphs)
         pair = (fw_action.stage_index, bw_action.stage_index)
         # The multiplexed graph is runtime-owned state because it is built once
@@ -638,7 +705,7 @@ class GraphPipelineRuntime:
             runtime_validate=(fw_stage._runtime_validate or bw_stage._runtime_validate),
         )
 
-        _accumulate_stage_unsharded_grads(bw_stage, param_grads)
+        self._accumulate_stage_backward_grads(bw_stage, bw_graphs, param_grads)
         _post_fwd_common(
             fw_stage,
             fw_mb_index,
@@ -722,7 +789,6 @@ def register_graph_pp_schedule(
         graph_provider (GraphPPStageGraphsProvider | None): Optional provider
             that builds or attaches stage graphs before the first runtime
             action in each step.
-
     Returns:
         GraphPipelineRuntime: Runtime that owns the registered bound action handlers.
 
@@ -744,4 +810,7 @@ def register_graph_pp_schedule(
         (OVERLAP_F_B, runtime._handle_overlap_fw_bw),
     ):
         schedule.register_custom_function(computation_type, handler)
+    schedule._comp_type_to_function_map[
+        FULL_FORWARD_BACKWARD
+    ] = runtime._handle_full_forward_backward  # pyrefly: ignore[bad-assignment]
     return runtime

@@ -18,7 +18,25 @@ from torch.distributed.pipelining.schedules import (
 from torch.distributed.pipelining.stage import PipelineStage
 
 
-class GraphPPStageGraphs(Protocol):
+class GraphPPRuntimeGraphs(Protocol):
+    """Gradient contract shared by split and joint stage graph executors."""
+
+    @property
+    def num_unsharded_param_grad_values(self) -> int:
+        """Return the number of ``unsharded_param_grads`` accumulator slots."""
+
+    @property
+    def requires_grad_reduction(self) -> bool:
+        """Return whether accumulated gradients require a reduction graph."""
+
+    def param_grads_for_accumulation(
+        self,
+        sharded_param_grads: list[Any],
+    ) -> list[Any]:
+        """Return reduced gradients in live parameter order."""
+
+
+class GraphPPStageGraphs(GraphPPRuntimeGraphs, Protocol):
     """Bound graph execution contract for one GraphPP pipeline stage.
 
     Implementations own their graph modules, metadata, and low-level graph
@@ -34,15 +52,6 @@ class GraphPPStageGraphs(Protocol):
             bool: ``True`` when ``backward_input`` and ``backward_weight``
             should run as separate schedule actions; ``False`` when
             ``FULL_BACKWARD`` is the only backward callable.
-        """
-
-    @property
-    def num_unsharded_param_grad_values(self) -> int:
-        """Return the number of unsharded param-grad accumulator slots.
-
-        Returns:
-            int: Number of flat values in ``GraphPPStageRuntimeState`` used to
-            accumulate unsharded parameter gradients across microbatches.
         """
 
     def unshard_params(
@@ -180,20 +189,18 @@ class GraphPPStageGraphs(Protocol):
             list[Any]: Flat sharded parameter-gradient values.
         """
 
-    def param_grads_for_accumulation(
+
+class GraphPPJointStageGraphs(GraphPPRuntimeGraphs, Protocol):
+    """Bound joint forward/loss/backward graph for a PP=1 stage."""
+
+    def forward_backward(
         self,
-        sharded_param_grads: list[Any],
-    ) -> list[Any]:
-        """Prepare parameter gradients for accumulation on model parameters.
-
-        Args:
-            sharded_param_grads (list[Any]): Flat reduced parameter-gradient
-                values.
-
-        Returns:
-            list[Any]: Parameter gradients ordered for
-            ``accumulate_param_grads_``.
-        """
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        target: Any,
+        loss_kwargs: dict[str, Any],
+    ) -> tuple[Any, list[Any]]:
+        """Run one joint graph and return its loss and parameter gradients."""
 
 
 class GraphPPOverlapGraphs(Protocol):
@@ -351,20 +358,19 @@ class GraphPipelineStage(PipelineStage):
             group=group,
             get_mesh=get_mesh,
         )
-        self.graphs: GraphPPStageGraphs | None = None
+        self.graphs: GraphPPStageGraphs | GraphPPJointStageGraphs | None = None
         self.state = GraphPPStageRuntimeState()
         self.saved_values_for_backward_weight_cache: dict[int, tuple[Any, ...]] = {}
         self._graph_pp_grads_scaled = False
 
     def set_graphs(
         self,
-        graphs: GraphPPStageGraphs,
+        graphs: GraphPPStageGraphs | GraphPPJointStageGraphs,
     ) -> None:
         """Attach a bound graph executor to this stage.
 
         Args:
-            graphs (GraphPPStageGraphs): Stage graph executor implementing the
-                GraphPP stage graph protocol.
+            graphs: Split or joint GraphPP stage graph executor.
         """
 
         self.graphs = graphs
