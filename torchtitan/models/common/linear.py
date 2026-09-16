@@ -14,6 +14,7 @@
 """
 
 from dataclasses import dataclass
+from functools import cache
 
 import spmd_types as spmd
 import torch
@@ -22,7 +23,8 @@ import torch.nn.functional as F
 from torch.autograd.function import once_differentiable
 
 from torchtitan.config import TORCH_DTYPE_MAP
-from torchtitan.distributed.spmd_types import spmd_mesh_group
+from torchtitan.distributed.parallel_dims import MeshAxisName
+from torchtitan.distributed.spmd_types import _per_axis_types, spmd_mesh_group
 from torchtitan.protocols.module import Module
 
 # Shape suffix legend for the router gate:
@@ -70,6 +72,168 @@ class CastLinear(Linear):
         return F.linear(
             input.to(self.compute_dtype), self.weight.to(self.compute_dtype), bias
         )
+
+
+def _tp_type(layout) -> spmd.PerMeshAxisSpmdType:
+    """Return the TP-axis type from a boundary layout."""
+    tp_type = _per_axis_types(layout).get(MeshAxisName.TP)
+    assert tp_type is not None
+    return tp_type
+
+
+class _ColumnParallelLinearMixin(Module):
+    """All-gather a TP-sharded input before the composed projection."""
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        tp_group = spmd_mesh_group(MeshAxisName.TP)
+        if tp_group is not None:
+            sharding_config = self._sharding_config
+            assert sharding_config is not None
+            assert sharding_config.in_src_shardings is not None
+            input_layout = sharding_config.in_src_shardings["input"]
+            input = spmd.redistribute(
+                input,
+                tp_group,
+                src=_tp_type(input_layout),
+                dst=spmd.R,
+                backward_options={"op_dtype": input.dtype},
+            )
+        return super().forward(input)
+
+
+class _RowParallelLinearMixin(Module):
+    """Reduce a TP-partial output after the composed projection."""
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        output = super().forward(input)
+        tp_group = spmd_mesh_group(MeshAxisName.TP)
+        if tp_group is None:
+            return output
+
+        sharding_config = self._sharding_config
+        assert sharding_config is not None
+        output_layout = sharding_config.out_src_shardings
+        assert output_layout is not None and not isinstance(output_layout, tuple)
+        return spmd.redistribute(
+            output,
+            tp_group,
+            src=spmd.P,
+            dst=_tp_type(output_layout),
+            backward_options={"op_dtype": output.dtype},
+        )
+
+
+class ColumnParallelLinear(_ColumnParallelLinearMixin, Linear):
+    """Linear that explicitly all-gathers its TP-sharded input."""
+
+    _underlying_linear_cls = Linear
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Linear.Config):
+        pass
+
+
+class RowParallelLinear(_RowParallelLinearMixin, Linear):
+    """Linear that explicitly reduces its TP-partial output."""
+
+    _underlying_linear_cls = Linear
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Linear.Config):
+        pass
+
+
+@cache
+def specialize_column_parallel_linear(
+    parent_cls: type[Module],
+) -> type[Module]:
+    """Add an outer input all-gather boundary to a Linear implementation.
+
+    Quantization and LoRA converters use this after replacing the underlying
+    Linear class. The mixin runs first in the MRO, all-gathers the input, and
+    calls ``super().forward()`` to preserve the converted Linear computation.
+    """
+    if issubclass(parent_cls, _ColumnParallelLinearMixin):
+        return parent_cls
+    if parent_cls is Linear:
+        return ColumnParallelLinear
+
+    parent_config_cls = parent_cls.Config
+
+    class SpecializedColumnParallelLinear(
+        _ColumnParallelLinearMixin, parent_cls  # type: ignore[misc, valid-type]
+    ):
+        @dataclass(kw_only=True, slots=True)
+        class Config(parent_config_cls):  # type: ignore[misc]
+            pass
+
+    SpecializedColumnParallelLinear.__name__ = f"ColumnParallel{parent_cls.__name__}"
+    SpecializedColumnParallelLinear.__qualname__ = (
+        f"ColumnParallel{parent_cls.__qualname__}"
+    )
+    SpecializedColumnParallelLinear._underlying_linear_cls = parent_cls
+    return SpecializedColumnParallelLinear
+
+
+@cache
+def specialize_row_parallel_linear(
+    parent_cls: type[Module],
+) -> type[Module]:
+    """Add an outer output-reduction boundary to a Linear implementation.
+
+    Quantization and LoRA converters use this after replacing the underlying
+    Linear class. The mixin calls ``super().forward()`` for that computation,
+    then reduce-scatters or all-reduces its partial output.
+    """
+    if issubclass(parent_cls, _RowParallelLinearMixin):
+        return parent_cls
+    if parent_cls is Linear:
+        return RowParallelLinear
+
+    parent_config_cls = parent_cls.Config
+
+    class SpecializedRowParallelLinear(
+        _RowParallelLinearMixin, parent_cls  # type: ignore[misc, valid-type]
+    ):
+        @dataclass(kw_only=True, slots=True)
+        class Config(parent_config_cls):  # type: ignore[misc]
+            pass
+
+    SpecializedRowParallelLinear.__name__ = f"RowParallel{parent_cls.__name__}"
+    SpecializedRowParallelLinear.__qualname__ = f"RowParallel{parent_cls.__qualname__}"
+    SpecializedRowParallelLinear._underlying_linear_cls = parent_cls
+    return SpecializedRowParallelLinear
+
+
+def is_column_parallel_linear_config(config: Module.Config) -> bool:
+    """Return whether a config builds an explicit column-parallel boundary."""
+    return config._owner is not None and issubclass(
+        config._owner, _ColumnParallelLinearMixin
+    )
+
+
+def is_row_parallel_linear_config(config: Module.Config) -> bool:
+    """Return whether a config builds an explicit row-parallel boundary."""
+    return config._owner is not None and issubclass(
+        config._owner, _RowParallelLinearMixin
+    )
+
+
+def underlying_linear_cls(config: Module.Config) -> type[Module]:
+    """Return the projection implementation inside a parallel boundary."""
+    assert config._owner is not None
+    return getattr(config._owner, "_underlying_linear_cls", config._owner)
+
+
+def preserve_parallel_linear_role(
+    replacement: type[Module], source_config: Module.Config
+) -> type[Module]:
+    """Apply ``source_config``'s column/row role to ``replacement``."""
+    if is_column_parallel_linear_config(source_config):
+        return specialize_column_parallel_linear(replacement)
+    if is_row_parallel_linear_config(source_config):
+        return specialize_row_parallel_linear(replacement)
+    return replacement
 
 
 @spmd.register_local_autograd_function
@@ -172,7 +336,15 @@ class PartialBiasRowwiseLinear(Linear):
 
 __all__ = [
     "CastLinear",
+    "ColumnParallelLinear",
     "Linear",
+    "RowParallelLinear",
     "PartialBiasRowwiseLinear",
     "RouterGateLinear",
+    "is_column_parallel_linear_config",
+    "is_row_parallel_linear_config",
+    "underlying_linear_cls",
+    "preserve_parallel_linear_role",
+    "specialize_column_parallel_linear",
+    "specialize_row_parallel_linear",
 ]
