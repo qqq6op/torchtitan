@@ -147,12 +147,14 @@ def _shared_experts_config(
         w13=Linear.Config(
             in_features=ffn.w13.in_features,
             out_features=ffn.w13.out_features,
+            num_linears=ffn.w13.num_linears,
             bias=ffn.w13.bias,
             param_init=ffn.w13.param_init,
         ),
         w2=Linear.Config(
             in_features=ffn.w2.in_features,
             out_features=ffn.w2.out_features,
+            num_linears=ffn.w2.num_linears,
             bias=ffn.w2.bias,
             param_init=ffn.w2.param_init,
         ),
