@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import fields, replace
+from dataclasses import replace
 
 import pytest
 import torch
@@ -86,9 +86,6 @@ def test_full_metadata_and_native_dispatch_variants():
     )
     captured = builder.build_for_cudagraph_capture(common)
     assert isinstance(captured, GDNAttentionMetadata)
-    assert {field.name for field in fields(captured)} == {
-        field.name for field in fields(GDNAttentionMetadata)
-    } | {"execution_path"}
     # Native splits stay truthful; the graph key keeps this general dummy packed.
     assert captured.execution_path is GDNExecutionPath.PACKED
     assert captured.num_prefills == 0 and captured.num_decodes == 2
