@@ -18,10 +18,13 @@ from torchtitan.models.common import (
     Embedding,
     FeedForward,
     Linear,
+    MLAFlexInnerAttention,
+    MLAVarlenInnerAttention,
     RouterGateLinear,
     Sigmoid,
     SiTUGLU,
 )
+from torchtitan.models.common.attention import FlexInnerAttention, VarlenInnerAttention
 from torchtitan.models.common.config_utils import (
     get_attention_config,
     make_ffn_config,
@@ -157,6 +160,15 @@ def _mla_config(
     attn_backend: str,
 ) -> KimiMLAAttention.Config:
     inner_attention = get_attention_config(attn_backend)
+    if isinstance(inner_attention, FlexInnerAttention.Config):
+        inner_attention = MLAFlexInnerAttention.Config(
+            block_size=inner_attention.block_size,
+            kernel_options=inner_attention.kernel_options,
+        )
+    elif isinstance(inner_attention, VarlenInnerAttention.Config):
+        inner_attention = MLAVarlenInnerAttention.Config(
+            window_size=inner_attention.window_size
+        )
 
     q_head_dim = qk_nope_head_dim + qk_rope_head_dim
     return KimiMLAAttention.Config(

@@ -54,6 +54,8 @@ __all__ = [
     "FlexInnerAttention",
     "GQAttention",
     "InnerAttention",
+    "MLAFlexInnerAttention",
+    "MLAVarlenInnerAttention",
     "QKVLinear",
     "ScaledDotProductInnerAttention",
     "VarlenInnerAttention",
@@ -381,6 +383,64 @@ class FlexInnerAttention(InnerAttention):
             return out_THV
         lse_TH = aux.lse.squeeze(0).transpose(0, 1)
         return out_transform(out_THV, lse_TH)
+
+
+def _materialize_mla_kv(
+    q_THK: torch.Tensor,
+    kv_THC: torch.Tensor,
+    k_rope_TR: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Materialize per-head K/V from MLA's packed KV and shared key."""
+    nope_head_dim = q_THK.shape[-1] - k_rope_TR.shape[-1]
+    k_nope_THN, v_THV = torch.split(
+        kv_THC,
+        [nope_head_dim, kv_THC.shape[-1] - nope_head_dim],
+        dim=-1,
+    )
+    k_rope_THR = k_rope_TR.unsqueeze(1).expand(-1, k_nope_THN.shape[1], -1)
+    k_THK = torch.cat((k_nope_THN, k_rope_THR), dim=-1)
+    return k_THK, v_THV
+
+
+class MLAFlexInnerAttention(FlexInnerAttention):
+    """Flex attention accepting MLA's packed KV and head-shared key.
+
+    ``q_THK`` has ``K = N + R``, ``kv_THC`` has ``C = N + V``, and
+    ``k_rope_TR`` is shared across heads. K and V are materialized only at the
+    local Flex Attention boundary.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(FlexInnerAttention.Config):
+        pass
+
+    def forward(  # pyrefly: ignore[bad-param-name-override]
+        self,
+        q_THK: torch.Tensor,
+        kv_THC: torch.Tensor,
+        k_rope_TR: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        k_THK, v_THV = _materialize_mla_kv(q_THK, kv_THC, k_rope_TR)
+        return super().forward(q_THK, k_THK, v_THV, **kwargs)
+
+
+class MLAVarlenInnerAttention(VarlenInnerAttention):
+    """Variable-length attention accepting MLA's compact K/V representation."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(VarlenInnerAttention.Config):
+        pass
+
+    def forward(  # pyrefly: ignore[bad-param-name-override]
+        self,
+        q_THK: torch.Tensor,
+        kv_THC: torch.Tensor,
+        k_rope_TR: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        k_THK, v_THV = _materialize_mla_kv(q_THK, kv_THC, k_rope_TR)
+        return super().forward(q_THK, k_THK, v_THV, **kwargs)
 
 
 # TODO: Verify whether SDPA support can be removed without losing performance

@@ -18,10 +18,10 @@ from torchtitan.distributed.context_parallel import (
     HeadTailLoadBalancer,
     PTRRLoadBalancer,
 )
-from torchtitan.models.common.attention import FlexInnerAttention
+from torchtitan.models.common.attention import MLAFlexInnerAttention
 from torchtitan.models.common.cp_attention import (
-    KVAllGatherCPFlexInnerAttention,
-    UlyssesCPFlexInnerAttention,
+    MLAKVAllGatherCPFlexInnerAttention,
+    MLAUlyssesCPFlexInnerAttention,
 )
 
 from torchtitan.models.kimi_k3 import _kimi_k3_config, _vision_encoder_config
@@ -212,7 +212,7 @@ class TestKimiK3(unittest.TestCase):
         assert config.model_spec is not None
         ContextParallelTransform(
             inner_attention={
-                FlexInnerAttention.Config: KVAllGatherCPFlexInnerAttention,
+                MLAFlexInnerAttention.Config: MLAKVAllGatherCPFlexInnerAttention,
                 InnerKDA.Config: ContextParallelInnerKDA,
             }
         ).transform(config.model_spec.model)
@@ -224,7 +224,7 @@ class TestKimiK3(unittest.TestCase):
             if layer.attention is not None:
                 self.assertIsInstance(
                     layer.attention.inner_attention,
-                    KVAllGatherCPFlexInnerAttention.Config,
+                    MLAKVAllGatherCPFlexInnerAttention.Config,
                 )
                 self.assertIsNotNone(layer.attention.inner_attention.sharding_config)
             if layer.delta_attention is not None:
@@ -247,7 +247,7 @@ class TestKimiK3(unittest.TestCase):
         assert config.model_spec is not None
         ContextParallelTransform(
             inner_attention={
-                FlexInnerAttention.Config: UlyssesCPFlexInnerAttention,
+                MLAFlexInnerAttention.Config: MLAUlyssesCPFlexInnerAttention,
                 InnerKDA.Config: ContextParallelInnerKDA,
             }
         ).transform(config.model_spec.model)
@@ -259,7 +259,7 @@ class TestKimiK3(unittest.TestCase):
             if layer.attention is not None:
                 self.assertIsInstance(
                     layer.attention.inner_attention,
-                    UlyssesCPFlexInnerAttention.Config,
+                    MLAUlyssesCPFlexInnerAttention.Config,
                 )
                 self.assertIsNotNone(layer.attention.inner_attention.sharding_config)
             if layer.delta_attention is not None:

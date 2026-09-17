@@ -28,6 +28,7 @@ from torchtitan.models.common.attention import (
     BaseAttention,
     create_varlen_metadata_for_document,
     FlexInnerAttention,
+    MLAFlexInnerAttention,
     VarlenInnerAttention,
     VarlenMetadata,
 )
@@ -67,8 +68,10 @@ class KimiK3AttentionMetadata(TypedDict):
 
 # Shape suffixes:
 # T = packed tokens, D = model dimension, C = projection channels, H = heads,
-# K = query/key head dimension, V = value head dimension,
-# N = attention-residual entries.
+# K = full query/key head dimension (N + R),
+# N = non-positional key dimension, R = shared key dimension,
+# V = value head dimension,
+# A = attention-residual entries.
 
 
 class KimiMLAAttention(BaseAttention):
@@ -96,7 +99,7 @@ class KimiMLAAttention(BaseAttention):
         gate: Linear.Config
         wo: Linear.Config
         inner_attention: Module.Config = field(
-            default_factory=FlexInnerAttention.Config
+            default_factory=MLAFlexInnerAttention.Config
         )
 
     def __init__(self, config: Config):
@@ -133,7 +136,7 @@ class KimiMLAAttention(BaseAttention):
         )
 
         compressed_kv_TC = self.wkv_a(x_TD)
-        kv_latent_TC, k_rope_TK = torch.split(
+        kv_latent_TC, k_rope_TR = torch.split(
             compressed_kv_TC,
             [self.kv_lora_rank, self.qk_rope_head_dim],
             dim=-1,
@@ -143,20 +146,10 @@ class KimiMLAAttention(BaseAttention):
             self.n_heads,
             self.qk_nope_head_dim + self.v_head_dim,
         )
-        k_nope_THK, v_THV = torch.split(
-            kv_THC,
-            [self.qk_nope_head_dim, self.v_head_dim],
-            dim=-1,
-        )
-        k_rope_THK = k_rope_TK.view(num_tokens, 1, self.qk_rope_head_dim).expand(
-            -1, self.n_heads, -1
-        )
-        k_THK = torch.cat((k_nope_THK, k_rope_THK), dim=-1)
-
         out_THV = self.inner_attention(
             q_THK,
-            k_THK,
-            v_THV,
+            kv_THC,
+            k_rope_TR,
             attention_masks=attention_masks,
             scale=self.scale,
         )
@@ -167,7 +160,7 @@ class KimiMLAAttention(BaseAttention):
 
 def _apply_attention_residual(
     prefix_sum_TD: torch.Tensor,
-    block_residual_TND: torch.Tensor,
+    block_residual_TAD: torch.Tensor,
     projection: Linear,
     norm: RMSNorm,
 ) -> torch.Tensor:
@@ -177,15 +170,15 @@ def _apply_attention_residual(
     """
     assert norm.eps is not None
 
-    values_TND = torch.cat((block_residual_TND, prefix_sum_TD.unsqueeze(1)), dim=1)
-    values_float = values_TND.float()
+    values_TAD = torch.cat((block_residual_TAD, prefix_sum_TD.unsqueeze(1)), dim=1)
+    values_float = values_TAD.float()
     variance = values_float.pow(2).mean(dim=-1, keepdim=True)
-    keys_TND = values_float * torch.rsqrt(variance + norm.eps)
+    keys_TAD = values_float * torch.rsqrt(variance + norm.eps)
     score_weight_D = norm.weight.float() * projection.weight.squeeze(0).float()
-    scores_TN = (keys_TND * score_weight_D).sum(dim=-1)
-    probs_T1N = torch.softmax(scores_TN, dim=-1).unsqueeze(1)
-    output_TD = torch.matmul(probs_T1N, values_float).squeeze(1)
-    return output_TD.to(values_TND.dtype)
+    scores_TA = (keys_TAD * score_weight_D).sum(dim=-1)
+    probs_T1A = torch.softmax(scores_TA, dim=-1).unsqueeze(1)
+    output_TD = torch.matmul(probs_T1A, values_float).squeeze(1)
+    return output_TD.to(values_TAD.dtype)
 
 
 class KimiK3TransformerBlock(Module):
@@ -247,7 +240,7 @@ class KimiK3TransformerBlock(Module):
     def forward(
         self,
         x_TD: torch.Tensor,
-        block_residual_TND: torch.Tensor,
+        block_residual_TAD: torch.Tensor,
         attention_metadata: KimiK3AttentionMetadata | None = None,
         positions: torch.Tensor | None = None,
         *,
@@ -255,21 +248,21 @@ class KimiK3TransformerBlock(Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         prefix_sum_TD = x_TD
 
-        if block_residual_TND.shape[1] > 0:
+        if block_residual_TAD.shape[1] > 0:
             assert self.attention_res_proj is not None
             assert self.attention_res_norm is not None
             x_TD = _apply_attention_residual(
                 prefix_sum_TD,
-                block_residual_TND,
+                block_residual_TAD,
                 self.attention_res_proj,
                 self.attention_res_norm,
             )
 
         opens_block = self.layer_id % self.attn_res_block_size == 0
         if opens_block:
-            block_residual_TND = torch.cat(
+            block_residual_TAD = torch.cat(
                 (
-                    block_residual_TND,
+                    block_residual_TAD,
                     prefix_sum_TD.unsqueeze(1),
                 ),
                 dim=1,
@@ -296,7 +289,7 @@ class KimiK3TransformerBlock(Module):
 
         h_TD = _apply_attention_residual(
             prefix_sum_TD,
-            block_residual_TND,
+            block_residual_TAD,
             self.ffn_res_proj,
             self.ffn_res_norm,
         )
@@ -306,7 +299,7 @@ class KimiK3TransformerBlock(Module):
         else:
             assert self.feed_forward is not None
             h_TD = self.feed_forward(h_TD)
-        return prefix_sum_TD + h_TD, block_residual_TND
+        return prefix_sum_TD + h_TD, block_residual_TAD
 
 
 class KimiK3Model(Decoder):
@@ -567,11 +560,11 @@ class KimiK3Model(Decoder):
                 dense_activation_placement(tp=spmd.I, cp=spmd.S(0)),
             )
 
-        block_residual_TND = h_TD.unsqueeze(1)[:, :0]
+        block_residual_TAD = h_TD.unsqueeze(1)[:, :0]
         for layer in self.layers.values():
-            h_TD, block_residual_TND = layer(
+            h_TD, block_residual_TAD = layer(
                 h_TD,
-                block_residual_TND,
+                block_residual_TAD,
                 attention_metadata=attention_masks,
                 positions=positions,
                 padding_mask=padding_mask,
@@ -579,7 +572,7 @@ class KimiK3Model(Decoder):
 
         h_TD = _apply_attention_residual(
             h_TD,
-            block_residual_TND,
+            block_residual_TAD,
             self.output_res_proj,
             self.output_res_norm,
         )
